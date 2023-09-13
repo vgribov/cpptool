@@ -1,0 +1,224 @@
+#!/bin/sh
+
+usage() {
+    printf "Usage:\n"
+    printf "  %s <command>\n\n"  ${0##*/}
+    printf "Commands:\n"
+    printf "  init\n"
+    printf "  build\n"
+    printf "  test [-c]\n"
+}
+
+cxx=${CXX:-c++}
+
+default_cxxflags="
+    -std=c++20
+    -Wall
+    -Wextra
+    -Werror
+"
+cxxflags=${CXXFLAGS:-$default_cxxflags}
+ldflags=${LDFLAGS}
+
+os="$(uname)"
+
+run() {
+    local sub
+    local out
+    local ok=0
+
+    [ "$1" == "__sub__" ] && { sub=1; shift; }
+    [ "$DEBUG" ] && echo "${indent}$@"
+    if [ "$sub" ]; then
+        out="$($@ 2>&1)"; ok=$?
+        if [ $ok -ne 0 ] || [ "$DEBUG" ]; then echo "$out"; fi
+        return $ok
+    else
+        $@
+    fi
+}
+
+mtime() {
+    if [ $os == Darwin ]; then
+        stat -f %m $1
+    else
+        stat -c %Y $1
+    fi
+}
+
+is_modified() {
+    local bin=$1; shift;
+    local bin_mtime
+    local src_mtime
+
+    if [ -e "$bin" ]; then
+        bin_mtime=$(mtime $bin)
+        for s in $@; do
+            src_mtime=$(mtime $s)
+            [ $src_mtime -gt $bin_mtime ] && return 0
+        done
+        return 1
+    fi
+    return 0
+}
+
+build() {
+    local main="$1"
+    local dir="${1%/*}"
+
+    local binary
+    if [ -z "${f##*_test.cpp}" ]; then
+        binary="${main##*/}"
+        binary="${binary%.cpp}"
+    else
+        binary="${dir##*/}"
+        [ "$binary" == "." ] && binary="${PWD##*/}"
+    fi
+
+    local src="$sources $main"
+    local out="$dir/$binary"
+
+    is_modified $out $src || return 0
+    run $cxx $cxxflags $src -o $out
+}
+
+add_bin() {
+    local main="$1"
+    local dir="${1%/*}"
+
+    [ "$DEBUG" ] && indent="  $indent"
+
+    sources=""
+    run add_sources ${dir} && run build $main || return 1
+}
+
+add_sources() {
+    local dir="$1"
+
+    for f in $dir/*; do
+        if [ -d $f ]; then
+            run add_dir $f
+            [ $? -eq 0 ] || return 1
+        else
+            if [ -f $f ] && [ ${f##*.} == "cpp" ]; then
+                [ -z "${f##*_test.cpp}" ] && continue
+                [ -z "${f##*main.cpp}" ] && continue
+                sources="$sources $f"
+            fi
+        fi
+    done
+    return 0
+}
+
+add_dir() {
+    local dir="$1"
+    local main_list
+
+    if [ "$testing" ]; then
+        for t in $dir/*; do
+            [ -z "${t##*_test.cpp}" ] && main_list="$main_list $t"
+        done
+    else
+        local m=$dir/main.cpp
+        if [ -f "$m" ]; then
+            main_list="$main_list $m"
+        fi
+    fi
+
+    if [ -n "$main_list" ]; then
+        for m in $main_list; do
+            run __sub__ add_bin $m || return 1
+        done
+    else
+        run add_sources $dir || return 1
+    fi
+}
+
+run_tests() {
+    local output
+
+    for t in $(find . -type f -iname '*_test'); do
+        printf "%s:" ${t##*/}
+        output=$($t 2>&1)
+        if [ $? -eq 0 ]; then
+            printf "\tOK\n"
+        else
+            printf "\n%s\n" "$output"
+        fi
+    done
+}
+
+clangd_config() {
+    printf "CompileFlags:\n"
+    printf "  Add:\n"
+    for flag in $cxxflags; do
+        printf "    - %s\n" $flag
+    done
+}
+
+find_config() {
+    local config
+    while true; do
+        config="$PWD/.clangd"
+        [ -e $config ] && { printf $config; return 0; }
+        [ "$PWD" == "/" ] && return 1
+        cd ..
+    done
+}
+
+load_clangd_config() {
+
+    which yq 1>/dev/null 2>&1
+    [ $? -eq 0 ] || {
+        printf "yq is not installed\n"
+        return 1
+    }
+    local config="$(find_config)"
+    [ $? -eq 0 ] || return 1
+
+    local val="$(yq -r '.CompileFlags.Add[]' $config)"
+    [ "$val" != "null" ] && cxxflags="$val"
+
+    if [ "$DEBUG" ]; then
+        echo "cxx:      " $cxx
+        echo "cxxflags: " $cxxflags
+    fi
+}
+
+do_init() {
+    clangd_config >.clangd
+}
+
+do_build() {
+    load_clangd_config
+    run add_dir .
+}
+
+do_test() {
+    testing=1
+
+    case $1 in
+        -c)
+            build_only=1
+            ;;
+    esac
+
+    load_clangd_config
+    run add_dir . || return 1
+    [ "$build_only" ] || run_tests
+}
+
+case $1 in
+    init)
+        shift; do_init $@
+        ;;
+    build)
+        shift; do_build $@
+        ;;
+    test)
+        shift; do_test $@
+        ;;
+    *)
+        usage
+        exit 1
+esac
