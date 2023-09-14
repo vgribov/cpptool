@@ -1,0 +1,1 @@
+// cpptool:CXXFLAGS: -DDEBUG

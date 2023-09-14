@@ -62,9 +62,46 @@ is_modified() {
     return 0
 }
 
+extract_from() {
+    shift
+    local kind=${1#cpptool:}; shift
+    kind=${kind%%:*}
+
+    local flags="$1"; shift
+    for f in $@; do flags="$flags $f"; done
+
+    case $kind in
+        CXXFLAGS)
+            cxxflags="$cxxflags $flags"
+            ;;
+        LDFLAGS)
+            ldflags="$ldflags $flags"
+            ;;
+    esac
+}
+
+extract_config() {
+    while read line; do
+        extract_from $line
+    done <<<"$(grep -h '// cpptool:' $@)"
+}
+
+filter_flags() {
+    for f in $@; do echo $f; done | sort -ru
+}
+
 build() {
     local main="$1"
     local dir="${1%/*}"
+
+    local src="$sources $main"
+    extract_config $src
+
+    cxxflags=$(filter_flags $cxxflags)
+    ldflags=$(filter_flags $ldflags)
+
+    [ "$testing" ] || update_config $dir
+    [ "$config_only" ] && return 0
 
     local binary
     if [ -z "${f##*_test.cpp}" ]; then
@@ -75,11 +112,9 @@ build() {
         [ "$binary" == "." ] && binary="${PWD##*/}"
     fi
 
-    local src="$sources $main"
     local out="$dir/$binary"
-
     is_modified $out $src || return 0
-    run $cxx $cxxflags $src -o $out
+    run $cxx -o $out $cxxflags $ldflags $src
 }
 
 add_bin() {
@@ -149,48 +184,28 @@ run_tests() {
 }
 
 clangd_config() {
+    local compile_flags="$@"
+
     printf "CompileFlags:\n"
     printf "  Add:\n"
-    for flag in $cxxflags; do
+    for flag in $compile_flags; do
         printf "    - %s\n" $flag
     done
 }
 
-find_config() {
-    local config
-    while true; do
-        config="$PWD/.clangd"
-        [ -e $config ] && { printf $config; return 0; }
-        [ "$PWD" == "/" ] && return 1
-        cd ..
-    done
-}
+update_config() {
+    [ "$testing" ] && return 0
 
-load_clangd_config() {
-
-    which yq 1>/dev/null 2>&1
-    [ $? -eq 0 ] || {
-        printf "yq is not installed\n"
-        return 1
-    }
-    local config="$(find_config)"
-    [ $? -eq 0 ] || return 1
-
-    local val="$(yq -r '.CompileFlags.Add[]' $config)"
-    [ "$val" != "null" ] && cxxflags="$val"
-
-    if [ "$DEBUG" ]; then
-        echo "cxx:      " $cxx
-        echo "cxxflags: " $cxxflags
-    fi
+    local dir="$1"
+    clangd_config $cxxflags >$dir/.clangd
 }
 
 do_init() {
-    clangd_config >.clangd
+    config_only=1
+    run add_dir .
 }
 
 do_build() {
-    load_clangd_config
     run add_dir .
 }
 
@@ -203,7 +218,6 @@ do_test() {
             ;;
     esac
 
-    load_clangd_config
     run add_dir . || return 1
     [ "$build_only" ] || run_tests
 }
